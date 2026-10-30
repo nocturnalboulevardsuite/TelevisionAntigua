@@ -1,7 +1,9 @@
 import base64
+import html as htmlmod
 import json
-import mimetypes
-from pathlib import Path
+import re
+
+import requests
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -19,8 +21,55 @@ iframe {display: block;}
 </style>
 """, unsafe_allow_html=True)
 
+DEFAULT_URLS = [
+    "https://makeagif.com/gif/jeff-the-killer-screamer-7f3UOH",
+    "https://static.wikia.nocookie.net/villains/images/8/88/SmileDog.jpg/revision/latest/scale-to-width/360?cb=20240914123554",
+    "https://tenor.com/search/scary-gifs",
+    "https://tenor.com/es-HN/search/laughing-pig-gifs",
+]
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+IMG_EXT = re.compile(r"\.(gif|jpe?g|png|webp)(\?|/|$)", re.I)
+
+
+@st.cache_data(ttl=3600, show_spinner="Buscando las imágenes...")
+def resolve_url(url: str, limit: int) -> list[str]:
+    """Devuelve links directos de imagen a partir de un link directo o de una página."""
+    url = url.strip()
+    if not url:
+        return []
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+    except requests.RequestException:
+        return [url] if IMG_EXT.search(url) else []
+    ctype = r.headers.get("Content-Type", "")
+    if ctype.startswith("image/"):
+        return [url]
+    page = htmlmod.unescape(r.text)
+    found = []
+    # Tenor: todos los GIFs de la página (búsquedas o un GIF individual)
+    for m in re.findall(r"https://media\d*\.tenor\.com/[^\s\"'<>]+?\.gif", page):
+        if m not in found:
+            found.append(m)
+    # Otras páginas (makeagif, etc.): la imagen de vista previa og:image
+    if not found:
+        for m in re.findall(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', page) + \
+                 re.findall(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', page):
+            if m not in found:
+                found.append(m)
+    return found[:limit]
+
+
 with st.sidebar:
     st.header("Configurar el susto")
+    urls_text = st.text_area(
+        "Links de imágenes o GIFs (uno por línea)",
+        value="\n".join(DEFAULT_URLS), height=180,
+        help="Sirven links directos (.gif/.jpg/.png) o páginas como makeagif o búsquedas de Tenor: "
+             "la app saca los GIFs de la página sola.")
+    max_per_page = st.slider("Máximo de GIFs por página de búsqueda", 1, 40, 12)
     img_files = st.file_uploader("Tus propias imágenes (opcional, varias)",
                                  type=["png", "jpg", "jpeg", "gif", "webp"],
                                  accept_multiple_files=True)
@@ -37,15 +86,20 @@ def to_data_uri(f):
     return f"data:{f.type};base64,{base64.b64encode(f.getvalue()).decode()}"
 
 
-# Fotos de la carpeta screamers/ + las que subas desde la barra lateral
-IMG_DIR = Path(__file__).parent / "screamers"
-folder_imgs = []
-if IMG_DIR.exists():
-    for f in sorted(IMG_DIR.iterdir()):
-        mime = mimetypes.guess_type(f.name)[0] or ""
-        if mime.startswith("image/"):
-            folder_imgs.append(f"data:{mime};base64,{base64.b64encode(f.read_bytes()).decode()}")
-custom_imgs = folder_imgs + [to_data_uri(f) for f in (img_files or [])]
+url_imgs, failed = [], []
+for u in urls_text.splitlines():
+    if not u.strip():
+        continue
+    got = resolve_url(u, max_per_page)
+    if got:
+        url_imgs += [g for g in got if g not in url_imgs]
+    else:
+        failed.append(u.strip())
+if failed:
+    st.sidebar.warning("No encontré imágenes en:\n\n" + "\n\n".join(failed))
+st.sidebar.caption(f"{len(url_imgs)} imágenes listas desde links")
+
+custom_imgs = url_imgs + [to_data_uri(f) for f in (img_files or [])]
 custom_snd = to_data_uri(snd_file) if snd_file else ""
 
 HTML = r"""
@@ -305,7 +359,20 @@ let timers = [], intervals = [], active = false, savedFrameStyle = null;
 let imgs = [], cur = -1, flipRaf = null, lastFlip = 0, lastBurst = 0, lastMsg = 0, flipping = false;
 
 // Precargar todas las fotos una vez, apiladas, para cambiar sin parpadeos de carga
-FRAMES.forEach(src => { const im = new Image(); im.src = src; im.alt = ""; faces.appendChild(im); imgs.push(im); });
+function addImg(src) {
+  const im = new Image(); im.referrerPolicy = "no-referrer"; im.decoding = "async";
+  im.alt = ""; im.src = src; faces.appendChild(im); imgs.push(im);
+}
+FRAMES.forEach(addImg);
+let pool = [];
+function buildPool() {   // solo las que cargaron bien; si ninguna, usa las criaturas dibujadas
+  pool = imgs.map((im, i) => i).filter(i => imgs[i].complete && imgs[i].naturalWidth > 0);
+  if (!pool.length) {
+    const start = imgs.length;
+    [HALL, MASK, INV, EYES, CAM, FINAL].forEach(addImg);
+    pool = imgs.slice(start).map((_, k) => start + k);
+  }
+}
 
 /* ---------- Pantalla completa ---------- */
 function goFullscreen() {
@@ -436,8 +503,8 @@ function setFrame(i) {
   cur = i; imgs[cur].classList.add("on");
 }
 function randomFrame() {
-  if (imgs.length === 1) return 0;
-  let n; do { n = Math.random() * imgs.length | 0; } while (n === cur);
+  if (pool.length === 1) return pool[0];
+  let n; do { n = pool[Math.random() * pool.length | 0]; } while (n === cur);
   return n;
 }
 function flipLoop(t) {
@@ -445,7 +512,7 @@ function flipLoop(t) {
   if (t - lastFlip >= FLIP_MS) { setFrame(randomFrame()); lastFlip = t; }
   if (t - lastBurst > 220) { playGlitchBurst(); lastBurst = t; }
   if (t - lastMsg > 300) {
-    $("cam").textContent = "CAM_" + String(cur + 1).padStart(2, "0");
+    $("cam").textContent = "CAM_" + String(pool.indexOf(cur) + 1).padStart(2, "0");
     $("msg").textContent = MSGS[Math.random() * MSGS.length | 0];
     $("addr").textContent = fakeAddress();
     lastMsg = t;
@@ -465,6 +532,7 @@ function startScare() {
   if (customAudio) { customAudio.currentTime = 0; customAudio.play().catch(() => playScream(SCARE_S + 1.5)); }
   else playScream(SCARE_S + 1.5);
 
+  buildPool();
   setFrame(randomFrame());
   flipping = true; lastFlip = lastBurst = lastMsg = 0;
   flipRaf = requestAnimationFrame(flipLoop);
