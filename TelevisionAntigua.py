@@ -1,5 +1,7 @@
 import base64
 import json
+import mimetypes
+from pathlib import Path
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -23,9 +25,11 @@ with st.sidebar:
                                  type=["png", "jpg", "jpeg", "gif", "webp"],
                                  accept_multiple_files=True)
     snd_file = st.file_uploader("Sonido propio (opcional)", type=["mp3", "wav", "ogg"])
-    static_ms = st.slider("Estática antes del susto (ms)", 0, 1000, 16, 1,
-                          help="16 ms es un solo cuadro de pantalla: lo mínimo visible.")
-    frame_ms = st.slider("Duración de cada aparición (ms)", 150, 1500, 420, 10)
+    static_ms = st.slider("Estática antes del susto (ms)", 0, 1000, 0, 1,
+                          help="0 = el susto sale de inmediato.")
+    flip_ms = st.slider("Cambio de foto cada (ms)", 0, 500, 0, 1,
+                        help="0 = una foto distinta en cada cuadro de pantalla (lo más rápido posible).")
+    scare_s = st.slider("Duración del bombardeo (s)", 1.0, 10.0, 4.0, 0.5)
     boost = st.slider("Amplificación digital del sonido", 1.0, 6.0, 4.0, 0.5)
 
 
@@ -33,7 +37,15 @@ def to_data_uri(f):
     return f"data:{f.type};base64,{base64.b64encode(f.getvalue()).decode()}"
 
 
-custom_imgs = [to_data_uri(f) for f in (img_files or [])]
+# Fotos de la carpeta screamers/ + las que subas desde la barra lateral
+IMG_DIR = Path(__file__).parent / "screamers"
+folder_imgs = []
+if IMG_DIR.exists():
+    for f in sorted(IMG_DIR.iterdir()):
+        mime = mimetypes.guess_type(f.name)[0] or ""
+        if mime.startswith("image/"):
+            folder_imgs.append(f"data:{mime};base64,{base64.b64encode(f.read_bytes()).decode()}")
+custom_imgs = folder_imgs + [to_data_uri(f) for f in (img_files or [])]
 custom_snd = to_data_uri(snd_file) if snd_file else ""
 
 HTML = r"""
@@ -102,8 +114,9 @@ HTML = r"""
   #overlay.show { display: block; }
   #scare { position: absolute; inset: 0; display: none; background: #000; overflow: hidden; }
   #scare.show { display: block; animation: flash .09s steps(2) infinite; }
-  #face { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
-    animation: lunge .16s ease-out forwards, shake .06s linear .16s infinite; }
+  #faces { position: absolute; inset: 0; animation: lunge .12s ease-out forwards, shake .05s linear .12s infinite; }
+  #faces img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; visibility: hidden; }
+  #faces img.on { visibility: visible; }
   .slice { position: absolute; inset: 0; background-size: cover; background-position: center;
     mix-blend-mode: screen; pointer-events: none; }
   .slice.r { filter: sepia(1) saturate(8) hue-rotate(-50deg); }
@@ -144,7 +157,6 @@ HTML = r"""
     .panel { width: 100%; flex-direction: row; justify-content: space-around; padding: 12px; }
     .grill { display: none; }
   }
-  @media (prefers-reduced-motion: reduce) { #scare.show { animation-duration: .4s; } }
 </style>
 </head>
 <body>
@@ -169,7 +181,7 @@ HTML = r"""
 
 <div id="overlay">
   <div id="scare">
-    <img id="face" alt="">
+    <div id="faces"></div>
     <div class="slice r"></div><div class="slice c"></div><div class="slice"></div>
   </div>
   <canvas id="noise" width="200" height="150"></canvas>
@@ -187,7 +199,8 @@ HTML = r"""
 const CUSTOM_IMGS = __IMGS__;
 const CUSTOM_SND  = __SND__;
 const STATIC_MS   = __STATIC_MS__;
-const FRAME_MS    = __FRAME_MS__;
+const FLIP_MS     = __FLIP_MS__;
+const SCARE_S     = __SCARE_S__;
 const BOOST       = __BOOST__;
 
 const svg = s => "data:image/svg+xml;utf8," + encodeURIComponent(
@@ -283,12 +296,16 @@ const MSGS = ["¿POR QUÉ LA ENCENDISTE?", "NO MIRES ATRÁS", "YA ESTÁ DENTRO",
 /* ---------- Elementos ---------- */
 const $ = id => document.getElementById(id);
 const power = $("power"), led = $("led"), overlay = $("overlay"), canvas = $("noise"),
-      scare = $("scare"), face = $("face"), hud = $("hud"), exitHint = $("exitHint");
+      scare = $("scare"), faces = $("faces"), hud = $("hud"), exitHint = $("exitHint");
 const slices = [...document.querySelectorAll(".slice")];
 const cctx = canvas.getContext("2d");
 
 let ac = null, bus = null, staticSrc = null, customAudio = null, rafId = null;
 let timers = [], intervals = [], active = false, savedFrameStyle = null;
+let imgs = [], cur = -1, flipRaf = null, lastFlip = 0, lastBurst = 0, lastMsg = 0, flipping = false;
+
+// Precargar todas las fotos una vez, apiladas, para cambiar sin parpadeos de carga
+FRAMES.forEach(src => { const im = new Image(); im.src = src; im.alt = ""; faces.appendChild(im); imgs.push(im); });
 
 /* ---------- Pantalla completa ---------- */
 function goFullscreen() {
@@ -346,7 +363,7 @@ function playScream(dur) {
   const pre = ac.createGain(); pre.gain.value = BOOST;
   const shaper = ac.createWaveShaper(); shaper.curve = distortionCurve(300);
   const env = ac.createGain();
-  env.gain.setValueAtTime(0, now); env.gain.linearRampToValueAtTime(1, now + 0.012);
+  env.gain.setValueAtTime(1, now);
   env.gain.setValueAtTime(1, now + dur - 0.4); env.gain.linearRampToValueAtTime(0, now + dur);
   pre.connect(shaper); shaper.connect(env); env.connect(bus);
   [1, 1.48, 2.03, 0.51, 2.97].forEach((m, i) => {
@@ -393,7 +410,7 @@ function drawNoise() {
   rafId = requestAnimationFrame(drawNoise);
 }
 function glitch() {
-  const src = face.src;
+  const src = imgs[cur] ? imgs[cur].src : "";
   slices.forEach(s => {
     if (Math.random() < 0.45) { s.style.display = "none"; return; }
     const t = Math.random() * 90, h = 2 + Math.random() * 14;
@@ -414,15 +431,26 @@ function tickClock() {
 }
 
 /* ---------- Secuencia ---------- */
-function showFrame(i) {
-  face.src = FRAMES[i];
-  face.style.animation = "none"; void face.offsetWidth; face.style.animation = "";
-  $("cam").textContent = "CAM_" + String(i + 1).padStart(2, "0");
-  $("msg").textContent = MSGS[i % MSGS.length];
-  $("addr").textContent = fakeAddress();
-  playGlitchBurst();
-  if (i < FRAMES.length - 1) timers.push(setTimeout(() => showFrame(i + 1), FRAME_MS));
-  else timers.push(setTimeout(() => { exitHint.style.display = "block"; }, 2500));
+function setFrame(i) {
+  if (imgs[cur]) imgs[cur].classList.remove("on");
+  cur = i; imgs[cur].classList.add("on");
+}
+function randomFrame() {
+  if (imgs.length === 1) return 0;
+  let n; do { n = Math.random() * imgs.length | 0; } while (n === cur);
+  return n;
+}
+function flipLoop(t) {
+  if (!flipping) return;
+  if (t - lastFlip >= FLIP_MS) { setFrame(randomFrame()); lastFlip = t; }
+  if (t - lastBurst > 220) { playGlitchBurst(); lastBurst = t; }
+  if (t - lastMsg > 300) {
+    $("cam").textContent = "CAM_" + String(cur + 1).padStart(2, "0");
+    $("msg").textContent = MSGS[Math.random() * MSGS.length | 0];
+    $("addr").textContent = fakeAddress();
+    lastMsg = t;
+  }
+  flipRaf = requestAnimationFrame(flipLoop);
 }
 
 function startScare() {
@@ -432,9 +460,20 @@ function startScare() {
   hud.classList.add("show");
   tickClock(); intervals.push(setInterval(tickClock, 1000));
   intervals.push(setInterval(glitch, 60));
-  if (customAudio) { customAudio.currentTime = 0; customAudio.play().catch(() => playScream(3.5)); }
-  else playScream(FRAME_MS * (FRAMES.length - 1) / 1000 + 2.2);
-  showFrame(0);
+
+  // Grito a todo volumen desde el primer instante
+  if (customAudio) { customAudio.currentTime = 0; customAudio.play().catch(() => playScream(SCARE_S + 1.5)); }
+  else playScream(SCARE_S + 1.5);
+
+  setFrame(randomFrame());
+  flipping = true; lastFlip = lastBurst = lastMsg = 0;
+  flipRaf = requestAnimationFrame(flipLoop);
+
+  timers.push(setTimeout(() => {          // al final se queda congelada una foto
+    flipping = false; cancelAnimationFrame(flipRaf);
+    $("msg").textContent = "NO APAGUES LA TELE";
+    exitHint.style.display = "block";
+  }, SCARE_S * 1000));
 }
 
 function turnOn() {
@@ -456,6 +495,8 @@ function reset() {
   active = false;
   timers.forEach(clearTimeout); intervals.forEach(clearInterval); timers = []; intervals = [];
   cancelAnimationFrame(rafId); stopStatic();
+  flipping = false; cancelAnimationFrame(flipRaf);
+  if (imgs[cur]) imgs[cur].classList.remove("on"); cur = -1;
   if (customAudio) { try { customAudio.pause(); } catch (e) {} customAudio = null; }
   if (ac) { try { ac.close(); } catch (e) {} ac = null; }
   scare.classList.remove("show"); hud.classList.remove("show"); overlay.classList.remove("show");
@@ -476,7 +517,8 @@ html = (HTML
         .replace("__IMGS__", json.dumps(custom_imgs))
         .replace("__SND__", json.dumps(custom_snd))
         .replace("__STATIC_MS__", str(static_ms))
-        .replace("__FRAME_MS__", str(frame_ms))
+        .replace("__FLIP_MS__", str(flip_ms))
+        .replace("__SCARE_S__", str(scare_s))
         .replace("__BOOST__", str(boost)))
 
 components.html(html, height=760, scrolling=False)
